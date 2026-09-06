@@ -1,0 +1,22 @@
+numpy>=1.26
+pandas>=2.0
+matplotlib>=3.8
+scipy>=1.12
+
+# Audio processing
+librosa>=0.10
+soundfile>=0.12
+
+# Machine learning
+scikit-learn>=1.4
+
+# Quantum ML (Qiskit 2.x ecosystem)
+qiskit>=2.0
+qiskit-machine-learning>=0.8
+qiskit-algorithms>=0.3
+
+# Optional: Speech-to-text branch
+openai-whisper>=20231117
+
+# Testing
+pytest>=8.0
