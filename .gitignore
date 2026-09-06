@@ -15,19 +15,10 @@ env/
 
 # Jupyter
 .ipynb_checkpoints/
-*.ipynb
 
-# Data (large files - do not commit raw audio)
-data/raw/RAVDESS/
-
-# Processed data and features (can be regenerated)
-data/processed/
+# Features / generated artifacts
 features/
-
-# Models
 models/
-
-# Results (figures / metrics generated from experiments)
 results/
 
 # Logs
