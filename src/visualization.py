@@ -112,7 +112,7 @@ def plot_pca_scatter(
     X_2d     = PCA(n_components=2, random_state=RANDOM_STATE).fit_transform(X_scaled)
 
     emotions = sorted(df["emotion"].unique())
-    cmap     = plt.cm.get_cmap("tab10", len(emotions))
+    cmap = plt.colormaps.get_cmap("tab10").resampled(len(emotions))
     emotion_to_idx = {e: i for i, e in enumerate(emotions)}
 
     fig, ax = plt.subplots(figsize=(10, 8))

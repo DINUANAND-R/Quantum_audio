@@ -1,64 +1,75 @@
 """
-config.py — Central configuration for Quantum-Audio-Emotion.
-
-All hyperparameters, paths, and toggles live here.
-No magic numbers should appear anywhere else in the codebase.
+config.py
+Central configuration for Quantum-Audio-Emotion.
 """
 
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Project root (resolves correctly regardless of where the script is called)
-# ---------------------------------------------------------------------------
+
+# ============================================================
+# PROJECT PATHS
+# ============================================================
+
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
-# ---------------------------------------------------------------------------
-# Data paths
-# ---------------------------------------------------------------------------
-DATA_DIR       = PROJECT_ROOT / "data"
-RAW_DATA_DIR   = DATA_DIR / "raw" / "RAVDESS"
-PROC_DATA_DIR  = DATA_DIR / "processed"
+DATA_DIR = PROJECT_ROOT / "data"
 
-# ---------------------------------------------------------------------------
-# Feature paths
-# ---------------------------------------------------------------------------
-FEATURES_DIR   = PROJECT_ROOT / "features"
-FEATURE_FILE   = FEATURES_DIR / "audio_features.csv"
-TRAIN_CSV      = PROC_DATA_DIR / "train.csv"
-TEST_CSV       = PROC_DATA_DIR / "test.csv"
+RAW_DATA_DIR = DATA_DIR / "raw" / "RAVDESS"
+
+PROC_DATA_DIR = DATA_DIR / "processed"
+
+FEATURES_DIR = PROJECT_ROOT / "features"
+
+FEATURE_FILE = FEATURES_DIR / "audio_features.csv"
+
+TRAIN_CSV = PROC_DATA_DIR / "train.csv"
+
+TEST_CSV = PROC_DATA_DIR / "test.csv"
+
 TRANSCRIPT_CSV = PROC_DATA_DIR / "transcripts.csv"
 
-# ---------------------------------------------------------------------------
-# Model paths
-# ---------------------------------------------------------------------------
-MODELS_DIR     = PROJECT_ROOT / "models"
+MODELS_DIR = PROJECT_ROOT / "models"
 
-# ---------------------------------------------------------------------------
-# Results paths
-# ---------------------------------------------------------------------------
-RESULTS_DIR    = PROJECT_ROOT / "results"
-FIGURES_DIR    = RESULTS_DIR / "figures"
-METRICS_DIR    = RESULTS_DIR / "metrics"
-PREDICTIONS_DIR= RESULTS_DIR / "predictions"
+RESULTS_DIR = PROJECT_ROOT / "results"
 
-# ---------------------------------------------------------------------------
-# Audio preprocessing
-# ---------------------------------------------------------------------------
-SAMPLE_RATE      = 22050   # Hz  – librosa default; covers full speech band
-N_FFT            = 2048    # FFT window size in samples
-HOP_LENGTH       = 512     # Hop between frames (≈23 ms at 22 kHz)
-TARGET_DURATION  = 3.0     # seconds – clips longer than this are trimmed/padded
-N_MFCC           = 40      # Number of Mel-Frequency Cepstral Coefficients
+FIGURES_DIR = RESULTS_DIR / "figures"
 
-# ---------------------------------------------------------------------------
-# Acoustic feature extraction
-# ---------------------------------------------------------------------------
-# Statistical summaries computed per feature track
-STAT_FUNCTIONS = ["mean", "std", "min", "max"]
+METRICS_DIR = RESULTS_DIR / "metrics"
 
-# ---------------------------------------------------------------------------
-# RAVDESS emotion mapping  (from filename position 3, 1-indexed)
-# ---------------------------------------------------------------------------
+PREDICTIONS_DIR = RESULTS_DIR / "predictions"
+
+
+# ============================================================
+# AUDIO PROCESSING
+# ============================================================
+
+SAMPLE_RATE = 22050
+
+N_FFT = 2048
+
+HOP_LENGTH = 512
+
+TARGET_DURATION = 3.0
+
+N_MFCC = 40
+
+
+# ============================================================
+# FEATURE EXTRACTION
+# ============================================================
+
+STAT_FUNCTIONS = [
+    "mean",
+    "std",
+    "min",
+    "max"
+]
+
+
+# ============================================================
+# EMOTION MAPPING
+# ============================================================
+
 EMOTION_MAP = {
     "01": "neutral",
     "02": "calm",
@@ -67,83 +78,174 @@ EMOTION_MAP = {
     "05": "angry",
     "06": "fearful",
     "07": "disgust",
-    "08": "surprised",
+    "08": "surprised"
 }
 
-# Numeric labels for ML models
+
 EMOTION_LABEL_MAP = {
-    "neutral":   0,
-    "calm":      1,
-    "happy":     2,
-    "sad":       3,
-    "angry":     4,
-    "fearful":   5,
-    "disgust":   6,
-    "surprised": 7,
+    "neutral": 0,
+    "calm": 1,
+    "happy": 2,
+    "sad": 3,
+    "angry": 4,
+    "fearful": 5,
+    "disgust": 6,
+    "surprised": 7
 }
 
-# ---------------------------------------------------------------------------
-# Speaker-independent split
-# ---------------------------------------------------------------------------
-# Actors 1–24; last N actors are reserved for testing
-TRAIN_ACTORS = list(range(1, 21))   # Actor 01–20  → training
-TEST_ACTORS  = list(range(21, 25))  # Actor 21–24  → testing
 
-# ---------------------------------------------------------------------------
-# PCA
-# ---------------------------------------------------------------------------
-N_PCA_COMPONENTS     = 4    # Number of PCA components fed to quantum circuits
-PCA_COMPONENTS_SWEEP = [4, 6, 8]  # Optional sweep for experiments
+EMOTION_NAMES = [
+    "neutral",
+    "calm",
+    "happy",
+    "sad",
+    "angry",
+    "fearful",
+    "disgust",
+    "surprised"
+]
 
-# ---------------------------------------------------------------------------
-# Quantum configuration
-# ---------------------------------------------------------------------------
-N_QUBITS         = 4        # Must equal N_PCA_COMPONENTS when using ZZFeatureMap
-FEATURE_MAP_REPS = 2        # ZZFeatureMap repetitions (entanglement depth)
-ANSATZ_REPS      = 1        # EfficientSU2 repetitions
 
-# ---------------------------------------------------------------------------
-# VQC training
-# ---------------------------------------------------------------------------
-VQC_MAX_ITER  = 100         # Maximum SPSA iterations (keep low for CPU feasibility)
-VQC_SHOTS     = None        # None → statevector simulation (exact); int → sampling
-VQC_SEED      = 42
+# ============================================================
+# SPEAKER-INDEPENDENT DATA SPLIT
+# ============================================================
 
-# ---------------------------------------------------------------------------
-# QSVC
-# ---------------------------------------------------------------------------
-QSVC_SHOTS    = None        # None → statevector kernel
+# Actors 1-20 -> Training
+# Actors 21-24 -> Testing
 
-# ---------------------------------------------------------------------------
-# Classical SVM
-# ---------------------------------------------------------------------------
-SVM_C         = 10.0
-SVM_KERNEL    = "rbf"
-SVM_GAMMA     = "scale"
+TRAIN_ACTORS = list(range(1, 21))
 
-# ---------------------------------------------------------------------------
+TEST_ACTORS = list(range(21, 25))
+
+
+# ============================================================
+# PCA CONFIGURATION
+# ============================================================
+
+# Main PCA dimension used by quantum models.
+#
+# We use 8 because the quantum models below use 8 qubits.
+N_PCA_COMPONENTS = 8
+
+
+# PCA experiments to compare.
+#
+# This allows us to test:
+# PCA-4
+# PCA-6
+# PCA-8
+# PCA-12
+# PCA-16
+
+PCA_COMPONENTS_SWEEP = [
+    4,
+    6,
+    8,
+    12,
+    16
+]
+
+
+# ============================================================
+# QUANTUM CONFIGURATION
+# ============================================================
+
+# Number of qubits used by quantum models.
+#
+# PCA-8 -> 8 features -> 8 qubits
+
+N_QUBITS = 8
+
+
+# Quantum feature map
+FEATURE_MAP_REPS = 1
+
+
+# Variational ansatz
+ANSATZ_REPS = 1
+
+
+# ============================================================
+# VQC CONFIGURATION
+# ============================================================
+
+# Maximum number of optimizer iterations
+VQC_MAX_ITER = 150
+
+
+# Faster configuration for development/testing
+FAST_VQC_MAX_ITER = 30
+
+
+# None means Statevector simulation
+# instead of shot-based sampling.
+VQC_SHOTS = None
+
+
 # Reproducibility
-# ---------------------------------------------------------------------------
-RANDOM_STATE  = 42
+VQC_SEED = 42
 
-# ---------------------------------------------------------------------------
-# Execution modes
-# ---------------------------------------------------------------------------
-# FAST_MODE: subsamples the dataset and uses fewer VQC iterations.
-#            Useful for quick smoke-tests.
-# FULL_MODE: uses the full dataset (still PCA-compressed for quantum models).
-FAST_MODE             = "fast"
-FULL_MODE             = "full"
-DEFAULT_MODE          = FULL_MODE
-FAST_MODE_SAMPLE_LIMIT = 200   # Max training samples in fast mode
-FAST_VQC_MAX_ITER     = 30    # Max SPSA iterations in fast mode
 
-# ---------------------------------------------------------------------------
-# Whisper (optional speech-to-text branch)
-# ---------------------------------------------------------------------------
-WHISPER_MODEL_SIZE = "base"   # tiny | base | small | medium | large
+# ============================================================
+# QSVC CONFIGURATION
+# ============================================================
 
-# ---------------------------------------------------------------------------
-# Multimodal fusion
-# ---------------------------------------------------------------------------
-FUSION_ALPHA = 0.5   # weight for acoustic branch: P_final = α·P_audio + (1-α)·P_text
+# None means exact/statevector-style simulation
+# where supported by the selected quantum backend.
+QSVC_SHOTS = None
+
+
+# ============================================================
+# CLASSICAL SVM CONFIGURATION
+# ============================================================
+
+SVM_C = 10.0
+
+SVM_KERNEL = "rbf"
+
+SVM_GAMMA = "scale"
+
+
+# ============================================================
+# RANDOM STATE
+# ============================================================
+
+RANDOM_STATE = 42
+
+
+# ============================================================
+# EXECUTION MODES
+# ============================================================
+
+FAST_MODE = "fast"
+
+FULL_MODE = "full"
+
+DEFAULT_MODE = FULL_MODE
+
+
+# Number of samples used in fast/development mode
+FAST_MODE_SAMPLE_LIMIT = 200
+
+
+# ============================================================
+# WHISPER CONFIGURATION
+# ============================================================
+
+WHISPER_MODEL_SIZE = "base"
+
+
+# ============================================================
+# MULTIMODAL FUSION
+# ============================================================
+
+# Weight used when combining acoustic and transcript features.
+#
+# Final fusion:
+#
+# fused_score =
+#     FUSION_ALPHA * acoustic_score
+#     +
+#     (1 - FUSION_ALPHA) * text_score
+
+FUSION_ALPHA = 0.5

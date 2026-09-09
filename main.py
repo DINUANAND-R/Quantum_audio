@@ -1,30 +1,25 @@
 """
-main.py — Command-line entry point for the Quantum-Audio-Emotion pipeline.
+main.py
 
-Usage
------
-  python main.py --stage dataset
-  python main.py --stage features
-  python main.py --stage classical
-  python main.py --stage pca
-  python main.py --stage qsvc
-  python main.py --stage vqc
-  python main.py --stage evaluate
-  python main.py --stage whisper          # optional STT branch
-  python main.py --stage all              # run complete pipeline
+Command-line entry point for Quantum-Audio-Emotion.
 
-Mode flags
-----------
-  python main.py --stage all --mode fast  # subsample + fewer iterations
-  python main.py --stage all --mode full  # full dataset (default)
+Pipeline:
 
-Other flags
------------
-  --n-components 4     Override PCA components
-  --n-qubits 4         Override number of qubits
-  --max-iter 100       Override VQC max iterations
-  --force-recompute    Re-extract features even if cache exists
-  --verbose            Enable DEBUG logging
+    Dataset
+       ↓
+    Feature Extraction
+       ↓
+    Speaker-Independent Split
+       ↓
+    Classical SVM
+       ↓
+    PCA
+       ↓
+    QSVC
+       ↓
+    VQC
+       ↓
+    Evaluation
 """
 
 from __future__ import annotations
@@ -34,13 +29,23 @@ import logging
 import sys
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Ensure project root is on sys.path when running from any subdirectory
-# ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(PROJECT_ROOT))
-
 import numpy as np
+import pandas as pd
+
+
+# ============================================================
+# PROJECT ROOT
+# ============================================================
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+
+# ============================================================
+# CONFIG
+# ============================================================
 
 from src.config import (
     DEFAULT_MODE,
@@ -57,309 +62,1116 @@ from src.config import (
     VQC_SHOTS,
 )
 
-# ---------------------------------------------------------------------------
-# Logging configuration
-# ---------------------------------------------------------------------------
+
+# ============================================================
+# LOGGING
+# ============================================================
+
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s  %(levelname)-8s  %(name)s: %(message)s",
+    format=(
+        "%(asctime)s "
+        "%(levelname)-8s "
+        "%(name)s: "
+        "%(message)s"
+    ),
     datefmt="%H:%M:%S",
 )
+
 logger = logging.getLogger("main")
 
 
-# ---------------------------------------------------------------------------
-# Stage runners
-# ---------------------------------------------------------------------------
+# ============================================================
+# DATASET
+# ============================================================
 
-def stage_dataset(args) -> None:
-    """Stage 1: Verify RAVDESS dataset."""
+def stage_dataset(args):
+    """
+    Verify that the RAVDESS dataset is available.
+    """
+
     from src.dataset import verify_dataset
+
+    print("\n[main] === DATASET STAGE ===")
+
     verify_dataset(RAW_DATA_DIR)
 
 
-def stage_features(args) -> None:
-    """Stage 2–4: Extract acoustic features + speaker-independent split."""
-    from src.dataset import load_ravdess_metadata
-    from src.dataset_split import save_splits, speaker_independent_split, verify_split
-    from src.feature_extraction import extract_features_for_dataset
-    from src.visualization import run_visualization_stage
+# ============================================================
+# BALANCED SAMPLING
+# ============================================================
 
-    print("\n[main] === FEATURE EXTRACTION STAGE ===")
-    metadata_df = load_ravdess_metadata(RAW_DATA_DIR)
-    feature_df  = extract_features_for_dataset(
-        metadata_df, force_recompute=args.force_recompute
+def _balanced_sample(
+    df: pd.DataFrame,
+    samples_per_class: int,
+    random_state: int = RANDOM_STATE,
+) -> pd.DataFrame:
+    """
+    Create a balanced subset while preserving all classes.
+
+    This is used only for FAST/development mode.
+
+    The final FULL experiment should use the complete
+    speaker-independent training and test sets.
+    """
+
+    if samples_per_class <= 0:
+        raise ValueError(
+            "samples_per_class must be greater than zero."
+        )
+
+    if "emotion" not in df.columns:
+        raise KeyError(
+            "'emotion' column is required for balanced sampling."
+        )
+
+    class_counts = df["emotion"].value_counts()
+
+    insufficient = class_counts[
+        class_counts < samples_per_class
+    ]
+
+    if len(insufficient) > 0:
+        raise ValueError(
+            "Not enough samples for balanced sampling.\n"
+            f"Required per class: {samples_per_class}\n"
+            f"Available:\n{class_counts}"
+        )
+
+    sampled_parts = []
+
+    for emotion in sorted(
+        df["emotion"].unique()
+    ):
+
+        class_df = df[
+            df["emotion"] == emotion
+        ]
+
+        sampled = class_df.sample(
+            n=samples_per_class,
+            random_state=random_state,
+        )
+
+        sampled_parts.append(
+            sampled
+        )
+
+    result = pd.concat(
+        sampled_parts,
+        ignore_index=True,
     )
 
-    # Apply fast-mode subsampling if requested
+    # Shuffle final result
+    result = result.sample(
+        frac=1.0,
+        random_state=random_state,
+    ).reset_index(drop=True)
+
+    return result
+
+
+# ============================================================
+# FEATURES
+# ============================================================
+
+def stage_features(args):
+    """
+    Extract acoustic features and create the
+    speaker-independent train/test split.
+
+    IMPORTANT:
+        Actors 1-20  → training
+        Actors 21-24 → testing
+
+    The test speakers are never used for training.
+    """
+
+    from src.dataset import (
+        load_ravdess_metadata,
+    )
+
+    from src.dataset_split import (
+        save_splits,
+        speaker_independent_split,
+        verify_split,
+    )
+
+    from src.feature_extraction import (
+        extract_features_for_dataset,
+    )
+
+    from src.visualization import (
+        run_visualization_stage,
+    )
+
+    print(
+        "\n[main] === FEATURE EXTRACTION STAGE ==="
+    )
+
+    # --------------------------------------------------------
+    # Metadata
+    # --------------------------------------------------------
+
+    metadata_df = load_ravdess_metadata(
+        RAW_DATA_DIR
+    )
+
+    print(
+        f"[main] Metadata samples: "
+        f"{len(metadata_df)}"
+    )
+
+    # --------------------------------------------------------
+    # Feature extraction
+    # --------------------------------------------------------
+
+    feature_df = extract_features_for_dataset(
+        metadata_df,
+        force_recompute=args.force_recompute,
+    )
+
+    if "actor_id" not in feature_df.columns:
+        raise KeyError(
+            "actor_id column missing from feature dataframe."
+        )
+
+    if "emotion" not in feature_df.columns:
+        raise KeyError(
+            "emotion column missing from feature dataframe."
+        )
+
+    # --------------------------------------------------------
+    # IMPORTANT:
+    #
+    # First create the speaker-independent split.
+    #
+    # Do NOT sample the complete dataframe before splitting,
+    # because that can accidentally remove important speakers.
+    # --------------------------------------------------------
+
+    train_df, test_df = speaker_independent_split(
+        feature_df
+    )
+
+    # --------------------------------------------------------
+    # Verify split
+    # --------------------------------------------------------
+
+    verify_split(
+        train_df,
+        test_df,
+    )
+
+    # --------------------------------------------------------
+    # FAST MODE
+    #
+    # Only reduce TRAINING data.
+    #
+    # NEVER reduce the final test set.
+    # --------------------------------------------------------
+
     if args.mode == FAST_MODE:
-        n = FAST_MODE_SAMPLE_LIMIT
-        print(f"\n[main] FAST MODE: sampling {n} training rows from full dataset.")
-        train_actors_df = feature_df[feature_df["actor_id"] <= 20]
-        test_actors_df  = feature_df[feature_df["actor_id"] >  20]
-        n_train = min(n, len(train_actors_df))
-        train_actors_df = train_actors_df.sample(n=n_train, random_state=RANDOM_STATE)
-        feature_df = pd.concat([train_actors_df, test_actors_df])
 
-    train_df, test_df = speaker_independent_split(feature_df)
-    verify_split(train_df, test_df)
-    save_splits(train_df, test_df)
+        print(
+            "\n[main] FAST MODE enabled."
+        )
 
-    run_visualization_stage(feature_df)
-    _print_dataset_summary(train_df, test_df, args)
+        print(
+            "[main] Reducing training data only."
+        )
 
+        # Use a balanced subset.
+        #
+        # Example:
+        # 25 samples × 8 emotions = 200 samples.
+        #
 
-def stage_classical(args) -> None:
-    """Stage 7: Train and evaluate Classical SVM."""
-    import pandas as pd
-    from src.classical_model import run_classical_stage
-    from src.dataset_split import load_splits
+        class_count = (
+            train_df["emotion"]
+            .nunique()
+        )
 
-    print("\n[main] === CLASSICAL SVM STAGE ===")
-    train_df, test_df = load_splits()
-    metrics = run_classical_stage(train_df, test_df)
-    _print_stage_summary("Classical SVM", metrics)
+        samples_per_class = max(
+            1,
+            FAST_MODE_SAMPLE_LIMIT
+            // class_count,
+        )
 
+        max_available = (
+            train_df["emotion"]
+            .value_counts()
+            .min()
+        )
 
-def stage_pca(args) -> None:
-    """Stage 8: Fit PCA on training data and transform both splits."""
-    import pandas as pd
-    from src.dataset_split import load_splits
-    from src.dimensionality_reduction import run_pca_stage
+        samples_per_class = min(
+            samples_per_class,
+            int(max_available),
+        )
 
-    print("\n[main] === PCA STAGE ===")
-    n_comp = args.n_components or N_PCA_COMPONENTS
-    train_df, test_df = load_splits()
-    X_train, y_train, X_test, y_test, scaler, pca = run_pca_stage(
-        train_df, test_df, n_components=n_comp
-    )
-    print(f"[main] PCA complete.  "
-          f"X_train: {X_train.shape},  X_test: {X_test.shape}")
+        train_df = _balanced_sample(
+            train_df,
+            samples_per_class=samples_per_class,
+            random_state=RANDOM_STATE,
+        )
 
+        print(
+            f"[main] FAST training samples: "
+            f"{len(train_df)}"
+        )
 
-def stage_qsvc(args) -> None:
-    """Stage 10: Train and evaluate QSVC."""
-    import pandas as pd
-    from src.dataset_split import load_splits
-    from src.dimensionality_reduction import (fit_scaler_pca, load_scaler_pca,
-                                               save_scaler_pca, transform,
-                                               get_labels, run_pca_stage)
-    from src.qsvc_model import run_qsvc_stage
+        print(
+            f"[main] Test samples retained: "
+            f"{len(test_df)}"
+        )
 
-    print("\n[main] === QSVC STAGE ===")
-    n_comp    = args.n_components or N_PCA_COMPONENTS
-    n_qubits  = args.n_qubits     or N_QUBITS
-    train_df, test_df = load_splits()
+    # --------------------------------------------------------
+    # Save splits
+    # --------------------------------------------------------
 
-    X_train, y_train, X_test, y_test, _, _ = run_pca_stage(
-        train_df, test_df, n_components=n_comp
-    )
-
-    _print_quantum_config(args, n_comp, n_qubits, mode=args.mode)
-
-    metrics = run_qsvc_stage(X_train, y_train, X_test, y_test, n_qubits=n_qubits)
-    _print_stage_summary("QSVC", metrics)
-
-
-def stage_vqc(args) -> None:
-    """Stage 11: Train and evaluate VQC."""
-    import pandas as pd
-    from src.dataset_split import load_splits
-    from src.dimensionality_reduction import run_pca_stage
-    from src.vqc_model import run_vqc_stage
-
-    print("\n[main] === VQC STAGE ===")
-    n_comp   = args.n_components or N_PCA_COMPONENTS
-    n_qubits = args.n_qubits     or N_QUBITS
-    max_iter = args.max_iter     or (FAST_VQC_MAX_ITER if args.mode == FAST_MODE
-                                     else VQC_MAX_ITER)
-
-    train_df, test_df = load_splits()
-    X_train, y_train, X_test, y_test, _, _ = run_pca_stage(
-        train_df, test_df, n_components=n_comp
+    save_splits(
+        train_df,
+        test_df,
     )
 
-    _print_quantum_config(args, n_comp, n_qubits, mode=args.mode, max_iter=max_iter)
+    # --------------------------------------------------------
+    # Visualization
+    # --------------------------------------------------------
+
+    try:
+
+        # Visualize complete feature dataframe.
+        run_visualization_stage(
+            feature_df
+        )
+
+    except Exception as exc:
+
+        logger.warning(
+            "Visualization skipped: %s",
+            exc,
+        )
+
+    # --------------------------------------------------------
+    # Final information
+    # --------------------------------------------------------
+
+    print(
+        "\n[main] Speaker-independent split ready."
+    )
+
+    print(
+        f"[main] Training samples: "
+        f"{len(train_df)}"
+    )
+
+    print(
+        f"[main] Test samples: "
+        f"{len(test_df)}"
+    )
+
+    print(
+        "\n[main] Training emotion distribution:"
+    )
+
+    print(
+        train_df["emotion"]
+        .value_counts()
+        .sort_index()
+    )
+
+    print(
+        "\n[main] Test emotion distribution:"
+    )
+
+    print(
+        test_df["emotion"]
+        .value_counts()
+        .sort_index()
+    )
+
+
+# ============================================================
+# CLASSICAL SVM
+# ============================================================
+
+def stage_classical(args):
+    """
+    Train and evaluate the classical SVM baseline.
+    """
+
+    from src.classical_model import (
+        run_classical_stage,
+    )
+
+    from src.dataset_split import (
+        load_splits,
+    )
+
+    print(
+        "\n[main] === CLASSICAL SVM STAGE ==="
+    )
+
+    train_df, test_df = load_splits()
+
+    metrics = run_classical_stage(
+        train_df,
+        test_df,
+    )
+
+    _print_stage_summary(
+        "Classical SVM",
+        metrics,
+    )
+
+
+# ============================================================
+# PCA
+# ============================================================
+
+def stage_pca(args):
+    """
+    Run PCA using only training data for fitting.
+
+    Test data is transformed using the already fitted
+    scaler and PCA.
+    """
+
+    from src.dataset_split import (
+        load_splits,
+    )
+
+    from src.dimensionality_reduction import (
+        run_pca_stage,
+    )
+
+    print(
+        "\n[main] === PCA STAGE ==="
+    )
+
+    n_components = (
+        args.n_components
+        if args.n_components is not None
+        else N_PCA_COMPONENTS
+    )
+
+    train_df, test_df = load_splits()
+
+    X_train, y_train, X_test, y_test, _, _ = (
+        run_pca_stage(
+            train_df,
+            test_df,
+            n_components=n_components,
+        )
+    )
+
+    print(
+        f"[main] PCA components: "
+        f"{n_components}"
+    )
+
+    print(
+        f"[main] X_train shape: "
+        f"{X_train.shape}"
+    )
+
+    print(
+        f"[main] X_test shape: "
+        f"{X_test.shape}"
+    )
+
+
+# ============================================================
+# QSVC
+# ============================================================
+
+def stage_qsvc(args):
+    """
+    Train and evaluate QSVC.
+
+    Important:
+        The complete held-out test set is used.
+
+    Only training data may be reduced in FAST mode.
+    """
+
+    from src.dataset_split import (
+        load_splits,
+    )
+
+    from src.dimensionality_reduction import (
+        run_pca_stage,
+    )
+
+    from src.qsvc_model import (
+        run_qsvc_stage,
+    )
+
+    print(
+        "\n[main] === QSVC STAGE ==="
+    )
+
+    n_components = (
+        args.n_components
+        if args.n_components is not None
+        else N_PCA_COMPONENTS
+    )
+
+    n_qubits = (
+        args.n_qubits
+        if args.n_qubits is not None
+        else N_QUBITS
+    )
+
+    # --------------------------------------------------------
+    # QSVC requires:
+    #
+    # number of PCA components == number of qubits
+    # --------------------------------------------------------
+
+    if n_components != n_qubits:
+
+        raise ValueError(
+            "\nQSVC configuration error.\n"
+            f"PCA components = {n_components}\n"
+            f"Qubits          = {n_qubits}\n\n"
+            "For the current QSVC implementation:\n"
+            "PCA components must equal number of qubits."
+        )
+
+    # --------------------------------------------------------
+    # Load speaker-independent split
+    # --------------------------------------------------------
+
+    train_df, test_df = load_splits()
+
+    # --------------------------------------------------------
+    # PCA
+    # --------------------------------------------------------
+
+    (
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        _,
+        _,
+    ) = run_pca_stage(
+        train_df,
+        test_df,
+        n_components=n_components,
+    )
+
+    # --------------------------------------------------------
+    # Configuration
+    # --------------------------------------------------------
+
+    _print_quantum_config(
+        n_components=n_components,
+        n_qubits=n_qubits,
+    )
+
+    print(
+        f"[main] QSVC training samples: "
+        f"{len(X_train)}"
+    )
+
+    print(
+        f"[main] QSVC test samples: "
+        f"{len(X_test)}"
+    )
+
+    # --------------------------------------------------------
+    # Train + evaluate
+    # --------------------------------------------------------
+
+    metrics = run_qsvc_stage(
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        n_qubits=n_qubits,
+    )
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    _print_stage_summary(
+        "QSVC",
+        metrics,
+    )
+
+
+# ============================================================
+# VQC
+# ============================================================
+
+def stage_vqc(args):
+    """
+    Train and evaluate VQC.
+
+    The final evaluation always uses the complete
+    held-out test set.
+    """
+
+    from src.dataset_split import (
+        load_splits,
+    )
+
+    from src.dimensionality_reduction import (
+        run_pca_stage,
+    )
+
+    from src.vqc_model import (
+        run_vqc_stage,
+    )
+
+    print(
+        "\n[main] === VQC STAGE ==="
+    )
+
+    # --------------------------------------------------------
+    # Configuration
+    # --------------------------------------------------------
+
+    n_components = (
+        args.n_components
+        if args.n_components is not None
+        else N_PCA_COMPONENTS
+    )
+
+    n_qubits = (
+        args.n_qubits
+        if args.n_qubits is not None
+        else N_QUBITS
+    )
+
+    max_iter = (
+        args.max_iter
+        if args.max_iter is not None
+        else (
+            FAST_VQC_MAX_ITER
+            if args.mode == FAST_MODE
+            else VQC_MAX_ITER
+        )
+    )
+
+    # --------------------------------------------------------
+    # VQC dimension check
+    # --------------------------------------------------------
+
+    if n_components != n_qubits:
+
+        raise ValueError(
+            "\nVQC configuration error.\n"
+            f"PCA components = {n_components}\n"
+            f"Qubits          = {n_qubits}\n\n"
+            "For the current VQC implementation:\n"
+            "PCA components must equal number of qubits."
+        )
+
+    # --------------------------------------------------------
+    # Load speaker-independent split
+    # --------------------------------------------------------
+
+    train_df, test_df = load_splits()
+
+    # --------------------------------------------------------
+    # PCA
+    # --------------------------------------------------------
+
+    (
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        _,
+        _,
+    ) = run_pca_stage(
+        train_df,
+        test_df,
+        n_components=n_components,
+    )
+
+    # --------------------------------------------------------
+    # Configuration
+    # --------------------------------------------------------
+
+    _print_quantum_config(
+        n_components=n_components,
+        n_qubits=n_qubits,
+        max_iter=max_iter,
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT
+    #
+    # Do NOT randomly select 100 test samples.
+    #
+    # The complete 240-sample held-out test set must be used
+    # for the final VQC evaluation.
+    # --------------------------------------------------------
+
+    print(
+        f"[main] VQC training samples: "
+        f"{len(X_train)}"
+    )
+
+    print(
+        f"[main] VQC test samples: "
+        f"{len(X_test)}"
+    )
+
+    # --------------------------------------------------------
+    # Train + evaluate
+    # --------------------------------------------------------
 
     metrics = run_vqc_stage(
-        X_train, y_train, X_test, y_test,
-        n_qubits=n_qubits, max_iter=max_iter,
-        random_state=VQC_SEED, shots=VQC_SHOTS,
+        X_train=X_train,
+        y_train=y_train,
+        X_test=X_test,
+        y_test=y_test,
+        n_qubits=n_qubits,
+        max_iter=max_iter,
+        random_state=VQC_SEED,
+        shots=VQC_SHOTS,
     )
-    _print_stage_summary("VQC", metrics)
+
+    # --------------------------------------------------------
+    # Summary
+    # --------------------------------------------------------
+
+    _print_stage_summary(
+        "VQC",
+        metrics,
+    )
 
 
-def stage_evaluate(args) -> None:
-    """Stage 12: Compare all models."""
-    print("\n[main] === EVALUATION / COMPARISON STAGE ===")
-    from src.evaluation import run_evaluation_stage
+# ============================================================
+# EVALUATION
+# ============================================================
+
+def stage_evaluate(args):
+    """
+    Compare saved model results.
+    """
+
+    from src.evaluation import (
+        run_evaluation_stage,
+    )
+
+    print(
+        "\n[main] === EVALUATION STAGE ==="
+    )
+
     run_evaluation_stage()
 
 
-def stage_whisper(args) -> None:
-    """Stage 13 (optional): Transcribe dataset with Whisper."""
-    print("\n[main] === WHISPER STT STAGE (OPTIONAL) ===")
-    from src.dataset import load_ravdess_metadata
-    from src.whisper_transcription import transcribe_dataset
+# ============================================================
+# WHISPER
+# ============================================================
 
-    metadata_df = load_ravdess_metadata(RAW_DATA_DIR)
-    transcribe_dataset(metadata_df, force_recompute=args.force_recompute)
+def stage_whisper(args):
+    """
+    Optional Whisper transcription stage.
+    """
+
+    from src.dataset import (
+        load_ravdess_metadata,
+    )
+
+    from src.whisper_transcription import (
+        transcribe_dataset,
+    )
+
+    print(
+        "\n[main] === WHISPER STAGE ==="
+    )
+
+    metadata_df = load_ravdess_metadata(
+        RAW_DATA_DIR
+    )
+
+    transcribe_dataset(
+        metadata_df,
+        force_recompute=args.force_recompute,
+    )
 
 
-def stage_all(args) -> None:
-    """Run the complete pipeline end-to-end."""
-    print("\n" + "=" * 60)
-    print("  QUANTUM-AUDIO-EMOTION — FULL PIPELINE")
-    print("=" * 60)
-    print(f"  Mode     : {args.mode.upper()}")
-    print(f"  PCA Comp : {args.n_components or N_PCA_COMPONENTS}")
-    print(f"  Qubits   : {args.n_qubits     or N_QUBITS}")
-    print()
+# ============================================================
+# ALL
+# ============================================================
+
+def stage_all(args):
+    """
+    Run the complete pipeline.
+    """
+
+    print(
+        "\n"
+        + "=" * 60
+    )
+
+    print(
+        " QUANTUM-AUDIO-EMOTION"
+    )
+
+    print(
+        " FULL PIPELINE"
+    )
+
+    print(
+        "=" * 60
+    )
+
+    # --------------------------------------------------------
+    # 1. Dataset
+    # --------------------------------------------------------
 
     stage_dataset(args)
+
+    # --------------------------------------------------------
+    # 2. Features + split
+    # --------------------------------------------------------
+
     stage_features(args)
+
+    # --------------------------------------------------------
+    # 3. Classical baseline
+    # --------------------------------------------------------
+
     stage_classical(args)
+
+    # --------------------------------------------------------
+    # 4. PCA
+    # --------------------------------------------------------
+
     stage_pca(args)
+
+    # --------------------------------------------------------
+    # 5. QSVC
+    # --------------------------------------------------------
+
     stage_qsvc(args)
+
+    # --------------------------------------------------------
+    # 6. VQC
+    # --------------------------------------------------------
+
     stage_vqc(args)
+
+    # --------------------------------------------------------
+    # 7. Evaluation
+    # --------------------------------------------------------
+
     stage_evaluate(args)
 
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-
-def _print_dataset_summary(train_df, test_df, args) -> None:
-    print(f"\n[main] Dataset summary:")
-    print(f"  Training samples : {len(train_df)}")
-    print(f"  Test samples     : {len(test_df)}")
-    print(f"  Feature columns  : {sum(1 for c in train_df.columns if c.startswith('feat_'))}")
-
-
-def _print_quantum_config(args, n_comp, n_qubits, mode, max_iter=None) -> None:
-    print(f"\n[main] Quantum configuration:")
-    print(f"  Mode            : {mode.upper()}")
-    print(f"  PCA components  : {n_comp}")
-    print(f"  Qubits          : {n_qubits}")
-    if max_iter is not None:
-        print(f"  VQC max_iter    : {max_iter}")
-
-
-def _print_stage_summary(name: str, metrics: dict) -> None:
-    print(f"\n[main] {name} complete:")
-    print(f"  Accuracy  : {metrics.get('accuracy',  'N/A')}")
-    print(f"  Macro F1  : {metrics.get('macro_f1',  'N/A')}")
-
-
-# ---------------------------------------------------------------------------
-# Argument parser
-# ---------------------------------------------------------------------------
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="quantum_audio_emotion",
-        description="Hybrid Quantum-Classical Speech Emotion Recognition (RAVDESS)",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  python main.py --stage dataset
-  python main.py --stage features
-  python main.py --stage classical
-  python main.py --stage pca
-  python main.py --stage qsvc
-  python main.py --stage vqc
-  python main.py --stage evaluate
-  python main.py --stage all --mode fast
-  python main.py --stage all --mode full
-  python main.py --stage whisper
-        """,
+    print(
+        "\n"
+        + "=" * 60
     )
+
+    print(
+        " PIPELINE COMPLETED"
+    )
+
+    print(
+        "=" * 60
+    )
+
+
+# ============================================================
+# HELPERS
+# ============================================================
+
+def _print_quantum_config(
+    n_components: int,
+    n_qubits: int,
+    max_iter: int | None = None,
+):
+    """
+    Print quantum experiment configuration.
+    """
+
+    print(
+        "\n[main] Quantum configuration:"
+    )
+
+    print(
+        f"  PCA components : "
+        f"{n_components}"
+    )
+
+    print(
+        f"  Qubits         : "
+        f"{n_qubits}"
+    )
+
+    if max_iter is not None:
+
+        print(
+            f"  VQC iterations : "
+            f"{max_iter}"
+        )
+
+
+def _print_stage_summary(
+    name: str,
+    metrics: dict,
+):
+    """
+    Print common model summary.
+    """
+
+    print(
+        f"\n[main] {name} complete"
+    )
+
+    print(
+        f"  Accuracy : "
+        f"{metrics.get('accuracy', 'N/A')}"
+    )
+
+    print(
+        f"  Macro F1 : "
+        f"{metrics.get('macro_f1', 'N/A')}"
+    )
+
+    print(
+        f"  Weighted F1 : "
+        f"{metrics.get('weighted_f1', 'N/A')}"
+    )
+
+    if "n_train" in metrics:
+
+        print(
+            f"  Train samples : "
+            f"{metrics.get('n_train')}"
+        )
+
+    if "n_test" in metrics:
+
+        print(
+            f"  Test samples : "
+            f"{metrics.get('n_test')}"
+        )
+
+
+# ============================================================
+# ARGUMENT PARSER
+# ============================================================
+
+def build_parser():
+    """
+    Build command-line argument parser.
+    """
+
+    parser = argparse.ArgumentParser(
+        description=(
+            "Hybrid Quantum-Classical "
+            "Speech Emotion Recognition"
+        )
+    )
+
+    # --------------------------------------------------------
+    # Stage
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--stage",
-        choices=["dataset", "features", "classical", "pca",
-                 "qsvc", "vqc", "evaluate", "whisper", "all"],
+        choices=[
+            "dataset",
+            "features",
+            "classical",
+            "pca",
+            "qsvc",
+            "vqc",
+            "evaluate",
+            "whisper",
+            "all",
+        ],
         default="dataset",
-        help="Pipeline stage to run (default: dataset)",
+        help="Pipeline stage to execute.",
     )
+
+    # --------------------------------------------------------
+    # Mode
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--mode",
-        choices=[FAST_MODE, FULL_MODE],
+        choices=[
+            FAST_MODE,
+            FULL_MODE,
+        ],
         default=DEFAULT_MODE,
-        help=f"Execution mode: '{FAST_MODE}' subsamples data; "
-             f"'{FULL_MODE}' uses everything (default: {DEFAULT_MODE})",
+        help=(
+            "fast = reduced training data; "
+            "full = complete training data."
+        ),
     )
+
+    # --------------------------------------------------------
+    # PCA
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--n-components",
         type=int,
         default=None,
-        help=f"Number of PCA components (default: {N_PCA_COMPONENTS})",
+        help=(
+            "Number of PCA components. "
+            "For quantum models this must equal "
+            "the number of qubits."
+        ),
     )
+
+    # --------------------------------------------------------
+    # Qubits
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--n-qubits",
         type=int,
         default=None,
-        help=f"Number of qubits (default: {N_QUBITS})",
+        help="Number of quantum circuit qubits.",
     )
+
+    # --------------------------------------------------------
+    # VQC iterations
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--max-iter",
         type=int,
         default=None,
-        help=f"VQC SPSA max iterations (default: {VQC_MAX_ITER})",
+        help="Maximum VQC SPSA iterations.",
     )
+
+    # --------------------------------------------------------
+    # Feature recomputation
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--force-recompute",
         action="store_true",
-        help="Re-extract features even if a cached file exists",
+        help=(
+            "Force feature/transcription "
+            "recomputation."
+        ),
     )
+
+    # --------------------------------------------------------
+    # Verbose
+    # --------------------------------------------------------
+
     parser.add_argument(
         "--verbose",
         action="store_true",
-        help="Enable DEBUG-level logging",
+        help="Enable verbose logging.",
     )
+
     return parser
 
 
-# ---------------------------------------------------------------------------
-# Entry point
-# ---------------------------------------------------------------------------
+# ============================================================
+# MAIN
+# ============================================================
 
-def main() -> None:
+def main():
+    """
+    Main CLI entry point.
+    """
+
     parser = build_parser()
-    args   = parser.parse_args()
+
+    args = parser.parse_args()
+
+    # --------------------------------------------------------
+    # Verbose logging
+    # --------------------------------------------------------
 
     if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
 
-    np.random.seed(RANDOM_STATE)
+        logging.getLogger().setLevel(
+            logging.DEBUG
+        )
 
-    # Dispatch to the correct stage
+    # --------------------------------------------------------
+    # Global random seed
+    # --------------------------------------------------------
+
+    np.random.seed(
+        RANDOM_STATE
+    )
+
+    # --------------------------------------------------------
+    # Stage mapping
+    # --------------------------------------------------------
+
     stages = {
-        "dataset"  : stage_dataset,
-        "features" : stage_features,
-        "classical": stage_classical,
-        "pca"      : stage_pca,
-        "qsvc"     : stage_qsvc,
-        "vqc"      : stage_vqc,
-        "evaluate" : stage_evaluate,
-        "whisper"  : stage_whisper,
-        "all"      : stage_all,
+
+        "dataset":
+            stage_dataset,
+
+        "features":
+            stage_features,
+
+        "classical":
+            stage_classical,
+
+        "pca":
+            stage_pca,
+
+        "qsvc":
+            stage_qsvc,
+
+        "vqc":
+            stage_vqc,
+
+        "evaluate":
+            stage_evaluate,
+
+        "whisper":
+            stage_whisper,
+
+        "all":
+            stage_all,
     }
 
-    runner = stages[args.stage]
+    # --------------------------------------------------------
+    # Execute
+    # --------------------------------------------------------
+
     try:
-        runner(args)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"\n[ERROR] {exc}")
-        sys.exit(1)
+
+        stages[
+            args.stage
+        ](args)
+
     except KeyboardInterrupt:
-        print("\n[main] Interrupted by user.")
+
+        print(
+            "\n[main] Pipeline interrupted."
+        )
+
         sys.exit(0)
+
     except Exception as exc:
-        logger.exception("Unhandled exception in stage '%s': %s", args.stage, exc)
+
+        logger.exception(
+            "Pipeline failed: %s",
+            exc,
+        )
+
         sys.exit(1)
 
+
+# ============================================================
+# ENTRY POINT
+# ============================================================
 
 if __name__ == "__main__":
-    # pandas imported here to avoid circular import risk from inside functions
-    import pandas as pd   # noqa: F401
+
     main()

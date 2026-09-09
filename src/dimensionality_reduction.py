@@ -1,34 +1,35 @@
 """
-dimensionality_reduction.py — PCA for quantum pre-processing.
+dimensionality_reduction.py
 
-WHY PCA IS NEEDED FOR QUANTUM CIRCUITS
----------------------------------------
-A quantum circuit of N qubits encodes N real values (one per qubit) in
-its rotation angles.  Classical audio features produce ~260-dimensional
-vectors.  Feeding 260 features into 260 qubits would be computationally
-intractable on classical simulators and on current NISQ hardware.
+Speaker-independent dimensionality reduction for
+Quantum-Audio-Emotion.
 
-PCA compresses the feature space down to N_PCA_COMPONENTS dimensions
-while retaining the directions of maximum variance.
+Pipeline:
 
-IMPORTANT DATA-LEAKAGE RULE
------------------------------
-  StandardScaler and PCA are ALWAYS fitted on TRAINING data ONLY.
-  The test set is transformed using the scaler and PCA fitted on train.
-  This is enforced in the code below.
+    Audio Features
+          ↓
+    StandardScaler
+          ↓
+        PCA
+          ↓
+    Classical / Quantum Models
+
+Important:
+- Scaler is fitted ONLY on training data.
+- PCA is fitted ONLY on training data.
+- Test data is transformed using the fitted scaler/PCA.
+- No information from test speakers is used during fitting.
 """
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
 from pathlib import Path
 
-import matplotlib
-matplotlib.use("Agg")   # non-interactive backend – no GUI required
 import matplotlib.pyplot as plt
 import numpy as np
-import pandas as pd
 from sklearn.decomposition import PCA
 from sklearn.preprocessing import StandardScaler
 
@@ -41,192 +42,809 @@ from src.config import (
 
 logger = logging.getLogger(__name__)
 
-# Where to persist fitted objects
-_SCALER_PATH = MODELS_DIR / "scaler.pkl"
-_PCA_PATH    = MODELS_DIR / "pca.pkl"
+
+# ============================================================
+# CONSTANTS
+# ============================================================
+
+# PCA values that can be tested experimentally.
+# More components preserve more acoustic information,
+# but quantum models require the number of components
+# to match the number of qubits.
+SUPPORTED_PCA_COMPONENTS = [4, 6, 8, 12, 16]
 
 
-# ---------------------------------------------------------------------------
-# Helper – identify feature columns
-# ---------------------------------------------------------------------------
+# ============================================================
+# HELPERS
+# ============================================================
 
-def _get_feature_cols(df: pd.DataFrame) -> list[str]:
-    """Return only the numeric feature columns (feat_XXXX)."""
-    return [c for c in df.columns if c.startswith("feat_")]
-
-
-# ---------------------------------------------------------------------------
-# Fit & transform
-# ---------------------------------------------------------------------------
-
-def fit_scaler_pca(
-    train_df: pd.DataFrame,
-    n_components: int = N_PCA_COMPONENTS,
-    random_state: int = RANDOM_STATE,
-) -> tuple[StandardScaler, PCA]:
+def get_feature_columns(df):
     """
-    Fit StandardScaler and PCA on TRAINING data.
+    Return all acoustic feature columns.
 
-    Parameters
-    ----------
-    train_df    : pd.DataFrame  — training feature matrix (contains feat_XXXX cols)
-    n_components: int           — number of PCA components
-    random_state: int
+    Features are expected to use the naming convention:
+
+        feat_0
+        feat_1
+        feat_2
+        ...
 
     Returns
     -------
-    (fitted_scaler, fitted_pca)
+    list[str]
+        Feature column names.
     """
-    feat_cols = _get_feature_cols(train_df)
-    X_train   = train_df[feat_cols].values.astype(np.float64)
 
-    # Replace any residual NaN/Inf with 0 (defensive)
-    X_train = np.nan_to_num(X_train, nan=0.0, posinf=0.0, neginf=0.0)
+    columns = [
+        column
+        for column in df.columns
+        if str(column).startswith("feat_")
+    ]
+
+    if not columns:
+        raise ValueError(
+            "No feature columns found. "
+            "Expected columns starting with 'feat_'."
+        )
+
+    return columns
+
+
+def get_labels(df):
+    """
+    Extract integer emotion labels from a dataframe.
+
+    Supported formats:
+        label
+        emotion_label
+        emotion
+
+    Returns
+    -------
+    np.ndarray
+        Integer labels.
+    """
+
+    if "label" in df.columns:
+        return df["label"].to_numpy(dtype=np.int64)
+
+    if "emotion_label" in df.columns:
+        return df["emotion_label"].to_numpy(dtype=np.int64)
+
+    if "emotion" in df.columns:
+        from src.config import EMOTION_LABEL_MAP
+
+        labels = df["emotion"].map(EMOTION_LABEL_MAP)
+
+        if labels.isna().any():
+            unknown = df.loc[
+                labels.isna(),
+                "emotion"
+            ].unique()
+
+            raise ValueError(
+                f"Unknown emotion labels found: {unknown}"
+            )
+
+        return labels.to_numpy(dtype=np.int64)
+
+    raise KeyError(
+        "Could not find emotion labels. "
+        "Expected 'label', 'emotion_label', or 'emotion'."
+    )
+
+
+def _clean_features(X):
+    """
+    Safely clean feature matrix.
+
+    Replaces:
+        NaN
+        +Inf
+        -Inf
+
+    with finite values.
+    """
+
+    X = np.asarray(X, dtype=np.float64)
+
+    X = np.nan_to_num(
+        X,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
+    return X
+
+
+def _validate_n_components(
+    n_components,
+    n_samples,
+    n_features,
+):
+    """
+    Validate PCA component count.
+    """
+
+    try:
+        n_components = int(n_components)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Invalid n_components: {n_components}"
+        ) from exc
+
+    if n_components <= 0:
+        raise ValueError(
+            "n_components must be greater than 0."
+        )
+
+    max_components = min(
+        n_samples,
+        n_features,
+    )
+
+    if n_components > max_components:
+        raise ValueError(
+            f"n_components={n_components} is too large. "
+            f"Maximum allowed value is {max_components} "
+            f"for {n_samples} samples and {n_features} features."
+        )
+
+    return n_components
+
+
+def _validate_train_test_features(
+    train_df,
+    test_df,
+):
+    """
+    Ensure train and test use exactly the same
+    feature columns in the same order.
+    """
+
+    train_features = get_feature_columns(train_df)
+    test_features = get_feature_columns(test_df)
+
+    if train_features != test_features:
+        missing_from_test = [
+            feature
+            for feature in train_features
+            if feature not in test_features
+        ]
+
+        extra_in_test = [
+            feature
+            for feature in test_features
+            if feature not in train_features
+        ]
+
+        raise ValueError(
+            "Train/test feature mismatch.\n"
+            f"Missing from test: {missing_from_test}\n"
+            f"Extra in test: {extra_in_test}"
+        )
+
+    return train_features
+
+
+# ============================================================
+# FIT SCALER + PCA
+# ============================================================
+
+def fit_scaler_pca(
+    train_df,
+    n_components=N_PCA_COMPONENTS,
+):
+    """
+    Fit StandardScaler and PCA using TRAINING DATA ONLY.
+
+    Parameters
+    ----------
+    train_df : pandas.DataFrame
+        Training dataframe.
+
+    n_components : int
+        Number of PCA components.
+
+    Returns
+    -------
+    scaler : StandardScaler
+    pca : PCA
+    """
+
+    features = get_feature_columns(train_df)
+
+    X_train = train_df[
+        features
+    ].to_numpy(
+        dtype=np.float64
+    )
+
+    X_train = _clean_features(
+        X_train
+    )
+
+    n_components = _validate_n_components(
+        n_components=n_components,
+        n_samples=X_train.shape[0],
+        n_features=X_train.shape[1],
+    )
+
+    # --------------------------------------------------------
+    # Standardization
+    # --------------------------------------------------------
 
     scaler = StandardScaler()
-    X_scaled = scaler.fit_transform(X_train)
 
-    pca = PCA(n_components=n_components, random_state=random_state)
-    pca.fit(X_scaled)
-
-    explained = np.sum(pca.explained_variance_ratio_) * 100
-    logger.info(
-        "PCA(%d components): explains %.2f%% of training variance.",
-        n_components, explained,
+    X_scaled = scaler.fit_transform(
+        X_train
     )
-    print(f"[PCA] n_components={n_components}  "
-          f"Explained variance={explained:.2f}%  "
-          f"(of training set)")
+
+    # --------------------------------------------------------
+    # PCA
+    # --------------------------------------------------------
+
+    pca = PCA(
+        n_components=n_components,
+        random_state=RANDOM_STATE,
+    )
+
+    pca.fit(
+        X_scaled
+    )
+
+    logger.info(
+        "PCA fitted: %d components",
+        n_components,
+    )
+
+    logger.info(
+        "Explained variance: %.4f",
+        np.sum(
+            pca.explained_variance_ratio_
+        ),
+    )
+
     return scaler, pca
 
 
+# ============================================================
+# TRANSFORM
+# ============================================================
+
 def transform(
-    df: pd.DataFrame,
-    scaler: StandardScaler,
-    pca: PCA,
-) -> np.ndarray:
+    df,
+    scaler,
+    pca,
+):
     """
-    Apply fitted scaler and PCA to a dataset.
+    Transform data using an already-fitted scaler and PCA.
 
-    Parameters
-    ----------
-    df     : pd.DataFrame  — feature matrix
-    scaler : fitted StandardScaler
-    pca    : fitted PCA
+    IMPORTANT:
+    This function NEVER fits anything.
 
-    Returns
-    -------
-    np.ndarray  shape (n_samples, n_components)
+    That prevents test-data leakage.
     """
-    feat_cols = _get_feature_cols(df)
-    X         = df[feat_cols].values.astype(np.float64)
-    X         = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-    X_scaled  = scaler.transform(X)
-    X_pca     = pca.transform(X_scaled)
+
+    features = get_feature_columns(df)
+
+    X = df[
+        features
+    ].to_numpy(
+        dtype=np.float64
+    )
+
+    X = _clean_features(
+        X
+    )
+
+    X_scaled = scaler.transform(
+        X
+    )
+
+    X_pca = pca.transform(
+        X_scaled
+    )
+
+    X_pca = np.asarray(
+        X_pca,
+        dtype=np.float64,
+    )
+
+    X_pca = np.nan_to_num(
+        X_pca,
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+
     return X_pca
 
 
-def get_labels(df: pd.DataFrame) -> np.ndarray:
-    """Extract the 'emotion' string labels from a feature DataFrame."""
-    return df["emotion"].values
+# ============================================================
+# SAVE
+# ============================================================
 
+def save_scaler_pca(
+    scaler,
+    pca,
+    n_components,
+):
+    """
+    Save fitted scaler and PCA models.
+    """
 
-# ---------------------------------------------------------------------------
-# Persist / load
-# ---------------------------------------------------------------------------
+    MODELS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-def save_scaler_pca(scaler: StandardScaler, pca: PCA) -> None:
-    """Pickle the fitted scaler and PCA to models/."""
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_SCALER_PATH, "wb") as f:
-        pickle.dump(scaler, f)
-    with open(_PCA_PATH, "wb") as f:
-        pickle.dump(pca, f)
-    logger.info("Saved scaler → %s", _SCALER_PATH)
-    logger.info("Saved PCA    → %s", _PCA_PATH)
+    n_components = int(
+        n_components
+    )
 
+    scaler_path = (
+        MODELS_DIR
+        / f"scaler_pca_{n_components}.pkl"
+    )
 
-def load_scaler_pca() -> tuple[StandardScaler, PCA]:
-    """Load previously fitted scaler and PCA from models/."""
-    if not _SCALER_PATH.exists() or not _PCA_PATH.exists():
-        raise FileNotFoundError(
-            f"Fitted scaler/PCA not found.\n"
-            f"Run:  python main.py --stage pca   first."
+    pca_path = (
+        MODELS_DIR
+        / f"pca_{n_components}.pkl"
+    )
+
+    config_path = (
+        MODELS_DIR
+        / f"pca_config_{n_components}.json"
+    )
+
+    # --------------------------------------------------------
+    # Save scaler
+    # --------------------------------------------------------
+
+    with open(
+        scaler_path,
+        "wb",
+    ) as file:
+        pickle.dump(
+            scaler,
+            file,
         )
-    with open(_SCALER_PATH, "rb") as f:
-        scaler = pickle.load(f)
-    with open(_PCA_PATH, "rb") as f:
-        pca = pickle.load(f)
+
+    # --------------------------------------------------------
+    # Save PCA
+    # --------------------------------------------------------
+
+    with open(
+        pca_path,
+        "wb",
+    ) as file:
+        pickle.dump(
+            pca,
+            file,
+        )
+
+    # --------------------------------------------------------
+    # Save metadata
+    # --------------------------------------------------------
+
+    metadata = {
+        "n_components": int(
+            pca.n_components_
+        ),
+        "n_features": int(
+            pca.n_features_in_
+        ),
+        "explained_variance_ratio": [
+            float(value)
+            for value in pca.explained_variance_ratio_
+        ],
+        "total_explained_variance": float(
+            np.sum(
+                pca.explained_variance_ratio_
+            )
+        ),
+        "random_state": RANDOM_STATE,
+    }
+
+    with open(
+        config_path,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        json.dump(
+            metadata,
+            file,
+            indent=2,
+        )
+
+    logger.info(
+        "Scaler saved: %s",
+        scaler_path,
+    )
+
+    logger.info(
+        "PCA saved: %s",
+        pca_path,
+    )
+
+    return (
+        scaler_path,
+        pca_path,
+    )
+
+
+# ============================================================
+# LOAD
+# ============================================================
+
+def load_scaler_pca(
+    n_components=N_PCA_COMPONENTS,
+):
+    """
+    Load previously fitted scaler and PCA.
+    """
+
+    n_components = int(
+        n_components
+    )
+
+    scaler_path = (
+        MODELS_DIR
+        / f"scaler_pca_{n_components}.pkl"
+    )
+
+    pca_path = (
+        MODELS_DIR
+        / f"pca_{n_components}.pkl"
+    )
+
+    if not scaler_path.exists():
+        raise FileNotFoundError(
+            f"Scaler not found: {scaler_path}"
+        )
+
+    if not pca_path.exists():
+        raise FileNotFoundError(
+            f"PCA not found: {pca_path}"
+        )
+
+    with open(
+        scaler_path,
+        "rb",
+    ) as file:
+        scaler = pickle.load(
+            file
+        )
+
+    with open(
+        pca_path,
+        "rb",
+    ) as file:
+        pca = pickle.load(
+            file
+        )
+
     return scaler, pca
 
 
-# ---------------------------------------------------------------------------
-# Visualization
-# ---------------------------------------------------------------------------
+# ============================================================
+# EXPLAINED VARIANCE PLOT
+# ============================================================
 
-def plot_explained_variance(pca: PCA, save: bool = True) -> None:
+def _plot_explained_variance(
+    pca,
+    n_components,
+):
     """
-    Plot cumulative explained variance ratio versus number of PCA components.
+    Plot cumulative explained variance.
     """
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
 
-    cumvar = np.cumsum(pca.explained_variance_ratio_) * 100
-    n_all  = len(pca.explained_variance_ratio_)
+    FIGURES_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
-    fig.suptitle("PCA Explained Variance", fontsize=14, fontweight="bold")
+    variance = np.asarray(
+        pca.explained_variance_ratio_,
+        dtype=np.float64,
+    )
 
-    # -- individual component bars
-    axes[0].bar(range(1, n_all + 1),
-                pca.explained_variance_ratio_ * 100,
-                color="#4C72B0", edgecolor="white")
-    axes[0].set_xlabel("Component")
-    axes[0].set_ylabel("Explained Variance (%)")
-    axes[0].set_title("Per-Component Variance")
+    cumulative = np.cumsum(
+        variance
+    )
 
-    # -- cumulative line
-    axes[1].plot(range(1, n_all + 1), cumvar, "o-", color="#DD8452", linewidth=2)
-    axes[1].axhline(y=90, color="grey", linestyle="--", alpha=0.7, label="90%")
-    axes[1].axhline(y=95, color="red",  linestyle="--", alpha=0.7, label="95%")
-    axes[1].set_xlabel("Number of Components")
-    axes[1].set_ylabel("Cumulative Explained Variance (%)")
-    axes[1].set_title("Cumulative Explained Variance")
-    axes[1].legend()
-    axes[1].set_ylim(0, 101)
+    plt.figure(
+        figsize=(8, 5)
+    )
+
+    components = np.arange(
+        1,
+        len(variance) + 1,
+    )
+
+    plt.plot(
+        components,
+        cumulative,
+        marker="o",
+    )
+
+    plt.xlabel(
+        "Number of PCA Components"
+    )
+
+    plt.ylabel(
+        "Cumulative Explained Variance"
+    )
+
+    plt.title(
+        f"PCA Explained Variance "
+        f"({n_components} components)"
+    )
+
+    plt.ylim(
+        0.0,
+        min(
+            1.0,
+            max(
+                1.0,
+                float(cumulative[-1]) + 0.05,
+            ),
+        ),
+    )
+
+    plt.grid(
+        alpha=0.3
+    )
 
     plt.tight_layout()
-    if save:
-        out = FIGURES_DIR / "pca_explained_variance.png"
-        plt.savefig(out, dpi=150, bbox_inches="tight")
-        print(f"[PCA] Variance plot saved → {out}")
+
+    output_path = (
+        FIGURES_DIR
+        / f"pca_variance_{n_components}.png"
+    )
+
+    plt.savefig(
+        output_path,
+        dpi=200,
+        bbox_inches="tight",
+    )
+
     plt.close()
 
+    logger.info(
+        "PCA variance plot saved: %s",
+        output_path,
+    )
 
-# ---------------------------------------------------------------------------
-# Full PCA stage
-# ---------------------------------------------------------------------------
+    return output_path
+
+
+# ============================================================
+# COMPONENT SUMMARY
+# ============================================================
+
+def _print_pca_summary(
+    pca,
+):
+    """
+    Print useful PCA statistics.
+    """
+
+    variance = (
+        pca.explained_variance_ratio_
+    )
+
+    cumulative = np.cumsum(
+        variance
+    )
+
+    print()
+    print("=" * 60)
+    print("PCA SUMMARY")
+    print("=" * 60)
+
+    print(
+        f"Components              : "
+        f"{pca.n_components_}"
+    )
+
+    print(
+        f"Original features       : "
+        f"{pca.n_features_in_}"
+    )
+
+    print(
+        f"Total explained variance: "
+        f"{np.sum(variance):.4f}"
+    )
+
+    print(
+        f"Explained variance (%)  : "
+        f"{np.sum(variance) * 100:.2f}%"
+    )
+
+    print(
+        f"First component         : "
+        f"{variance[0]:.4f}"
+    )
+
+    print(
+        f"Last component          : "
+        f"{variance[-1]:.4f}"
+    )
+
+    print()
+
+    for index, value in enumerate(
+        cumulative,
+        start=1,
+    ):
+        print(
+            f"PC{index:<2} cumulative variance: "
+            f"{value:.4f}"
+        )
+
+    print("=" * 60)
+    print()
+
+
+# ============================================================
+# COMPLETE PCA STAGE
+# ============================================================
 
 def run_pca_stage(
-    train_df: pd.DataFrame,
-    test_df:  pd.DataFrame,
-    n_components: int = N_PCA_COMPONENTS,
-) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, StandardScaler, PCA]:
+    train_df,
+    test_df,
+    n_components=N_PCA_COMPONENTS,
+):
     """
-    Fit scaler + PCA on train, transform both train and test.
+    Complete PCA pipeline.
+
+    Steps:
+
+        1. Validate train/test features
+        2. Fit scaler on train
+        3. Fit PCA on train
+        4. Transform train
+        5. Transform test
+        6. Extract labels
+        7. Save scaler/PCA
+        8. Save explained variance plot
 
     Returns
     -------
-    X_train_pca, y_train, X_test_pca, y_test, scaler, pca
+    X_train
+    y_train
+    X_test
+    y_test
+    scaler
+    pca
     """
-    scaler, pca = fit_scaler_pca(train_df, n_components=n_components)
-    save_scaler_pca(scaler, pca)
-    plot_explained_variance(pca)
 
-    X_train_pca = transform(train_df, scaler, pca)
-    X_test_pca  = transform(test_df,  scaler, pca)
-    y_train     = get_labels(train_df)
-    y_test      = get_labels(test_df)
+    # --------------------------------------------------------
+    # Validate feature consistency
+    # --------------------------------------------------------
 
-    print(f"[PCA] X_train_pca shape : {X_train_pca.shape}")
-    print(f"[PCA] X_test_pca  shape : {X_test_pca.shape}")
-    return X_train_pca, y_train, X_test_pca, y_test, scaler, pca
+    _validate_train_test_features(
+        train_df,
+        test_df,
+    )
+
+    # --------------------------------------------------------
+    # Fit
+    # --------------------------------------------------------
+
+    scaler, pca = fit_scaler_pca(
+        train_df,
+        n_components=n_components,
+    )
+
+    # --------------------------------------------------------
+    # Transform
+    # --------------------------------------------------------
+
+    X_train = transform(
+        train_df,
+        scaler,
+        pca,
+    )
+
+    X_test = transform(
+        test_df,
+        scaler,
+        pca,
+    )
+
+    # --------------------------------------------------------
+    # Labels
+    # --------------------------------------------------------
+
+    y_train = get_labels(
+        train_df
+    )
+
+    y_test = get_labels(
+        test_df
+    )
+
+    # --------------------------------------------------------
+    # Sanity checks
+    # --------------------------------------------------------
+
+    if X_train.shape[0] != len(y_train):
+        raise ValueError(
+            "Training feature/label count mismatch."
+        )
+
+    if X_test.shape[0] != len(y_test):
+        raise ValueError(
+            "Test feature/label count mismatch."
+        )
+
+    if X_train.shape[1] != int(n_components):
+        raise ValueError(
+            "Unexpected PCA training dimension."
+        )
+
+    if X_test.shape[1] != int(n_components):
+        raise ValueError(
+            "Unexpected PCA test dimension."
+        )
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
+    save_scaler_pca(
+        scaler,
+        pca,
+        n_components,
+    )
+
+    # --------------------------------------------------------
+    # Plot
+    # --------------------------------------------------------
+
+    _plot_explained_variance(
+        pca,
+        n_components,
+    )
+
+    # --------------------------------------------------------
+    # Print summary
+    # --------------------------------------------------------
+
+    _print_pca_summary(
+        pca
+    )
+
+    print(
+        f"[PCA] Components : "
+        f"{pca.n_components_}"
+    )
+
+    print(
+        f"[PCA] Variance   : "
+        f"{np.sum(pca.explained_variance_ratio_):.4f}"
+    )
+
+    print(
+        f"[PCA] X_train    : "
+        f"{X_train.shape}"
+    )
+
+    print(
+        f"[PCA] X_test     : "
+        f"{X_test.shape}"
+    )
+
+    return (
+        X_train,
+        y_train,
+        X_test,
+        y_test,
+        scaler,
+        pca,
+    )

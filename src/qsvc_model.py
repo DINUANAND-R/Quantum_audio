@@ -1,19 +1,24 @@
 """
-qsvc_model.py — Quantum Support Vector Classifier (QSVC).
+qsvc_model.py — Quantum Support Vector Classifier (QSVC)
 
-HOW QSVC WORKS
----------------
-  1. Classical PCA features → ZZFeatureMap → quantum state |ψ(x)⟩
-  2. Quantum kernel  K(x_i, x_j) = |⟨ψ(x_i)|ψ(x_j)⟩|²
-     (The overlap of two quantum states serves as the kernel function)
-  3. This kernel matrix is fed into a classical SVM
-  4. The SVM finds the optimal hyperplane in the RKHS induced by the
-     quantum kernel
+Pipeline:
 
-The kernel computation is the only quantum step; the SVM optimisation
-is entirely classical.
+    PCA features
+          ↓
+    ZZFeatureMap
+          ↓
+    Fidelity Quantum Kernel
+          ↓
+    Classical SVM
+          ↓
+    Emotion prediction
 
-API: qiskit >= 2.0, qiskit-machine-learning >= 0.8
+The quantum part computes the kernel matrix.
+The final SVM optimisation is classical.
+
+Compatible with:
+    Qiskit >= 2.0
+    qiskit-machine-learning >= 0.8
 """
 
 from __future__ import annotations
@@ -21,13 +26,17 @@ from __future__ import annotations
 import json
 import logging
 import pickle
+import time
 from pathlib import Path
 
 import matplotlib
+
 matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
 from sklearn.metrics import (
     accuracy_score,
     classification_report,
@@ -38,6 +47,7 @@ from sklearn.metrics import (
 )
 
 from src.config import (
+    FEATURE_MAP_REPS,
     FIGURES_DIR,
     METRICS_DIR,
     MODELS_DIR,
@@ -46,240 +56,1105 @@ from src.config import (
     QSVC_SHOTS,
     RANDOM_STATE,
 )
+
 from src.quantum_features import build_feature_map
+
 
 logger = logging.getLogger(__name__)
 
+
+# ============================================================
+# MODEL PATHS
+# ============================================================
+
 _QSVC_PATH = MODELS_DIR / "qsvc.pkl"
 
+_QSVC_CONFIG_PATH = (
+    MODELS_DIR / "qsvc_config.json"
+)
 
-# ---------------------------------------------------------------------------
-# Build & train
-# ---------------------------------------------------------------------------
 
-def build_qsvc(n_qubits: int = N_QUBITS):
+# ============================================================
+# VALIDATION
+# ============================================================
+
+def _validate_data(
+    X: np.ndarray,
+    y: np.ndarray,
+    name: str,
+) -> None:
     """
-    Construct a QSVC using the FidelityQuantumKernel.
-
-    Qiskit Machine Learning >= 0.7 uses:
-      FidelityQuantumKernel  (replaced QuantumKernel in older versions)
-
-    Parameters
-    ----------
-    n_qubits : int
-
-    Returns
-    -------
-    QSVC instance (unfitted)
+    Validate X and y before quantum kernel computation.
     """
-    try:
-        # Qiskit Machine Learning >= 0.7 API
-        from qiskit_machine_learning.kernels import FidelityQuantumKernel
-        from qiskit_machine_learning.algorithms import QSVC as QiskitQSVC
 
-        feature_map = build_feature_map(n_qubits=n_qubits)
-        kernel      = FidelityQuantumKernel(feature_map=feature_map)
-        qsvc        = QiskitQSVC(quantum_kernel=kernel)
-        print(f"[qsvc] Using FidelityQuantumKernel (Qiskit ML >= 0.7 API)")
-        return qsvc
+    X = np.asarray(X)
+    y = np.asarray(y).reshape(-1)
 
-    except ImportError as e:
-        raise ImportError(
-            f"Could not import QSVC or FidelityQuantumKernel.\n"
-            f"Ensure qiskit-machine-learning >= 0.7 is installed.\n"
-            f"Original error: {e}"
+    if X.ndim != 2:
+        raise ValueError(
+            f"{name}: X must be a 2D array. "
+            f"Received shape={X.shape}"
         )
 
+    if len(X) != len(y):
+        raise ValueError(
+            f"{name}: X and y have different lengths. "
+            f"X={len(X)}, y={len(y)}"
+        )
+
+    if len(X) == 0:
+        raise ValueError(
+            f"{name}: dataset is empty."
+        )
+
+    if not np.all(np.isfinite(X)):
+        raise ValueError(
+            f"{name}: X contains NaN or infinite values."
+        )
+
+
+def _validate_qubits(
+    X: np.ndarray,
+    n_qubits: int,
+) -> None:
+    """
+    Ensure PCA dimensionality matches quantum circuit size.
+    """
+
+    if n_qubits <= 0:
+        raise ValueError(
+            "n_qubits must be greater than zero."
+        )
+
+    if X.shape[1] != n_qubits:
+        raise ValueError(
+            "\nQSVC dimension mismatch.\n"
+            f"Expected {n_qubits} features "
+            f"for {n_qubits} qubits.\n"
+            f"Received {X.shape[1]} features.\n\n"
+            "Make sure:\n"
+            "PCA components == N_QUBITS"
+        )
+
+
+# ============================================================
+# BUILD QSVC
+# ============================================================
+
+def build_qsvc(
+    n_qubits: int = N_QUBITS,
+    feature_map_reps: int = FEATURE_MAP_REPS,
+):
+    """
+    Construct a QSVC using FidelityQuantumKernel.
+
+    Important for Qiskit 2.x:
+        Do NOT pass a sampler to FidelityQuantumKernel.
+
+    The kernel is constructed as:
+
+        K(x, y) = |<psi(x)|psi(y)>|^2
+    """
+
+    if n_qubits <= 0:
+        raise ValueError(
+            "n_qubits must be greater than zero."
+        )
+
+    if feature_map_reps <= 0:
+        raise ValueError(
+            "feature_map_reps must be greater than zero."
+        )
+
+    try:
+
+        from qiskit_machine_learning.kernels import (
+            FidelityQuantumKernel
+        )
+
+        from qiskit_machine_learning.algorithms import (
+            QSVC as QiskitQSVC
+        )
+
+    except ImportError:
+
+        try:
+
+            from qiskit_machine_learning.kernels import (
+                FidelityQuantumKernel
+            )
+
+            from qiskit_machine_learning.algorithms.classifiers import (
+                QSVC as QiskitQSVC
+            )
+
+        except ImportError as exc:
+
+            raise ImportError(
+                "\nCould not import QSVC or "
+                "FidelityQuantumKernel.\n\n"
+                "Install using:\n"
+                "python -m pip install -U "
+                "qiskit-machine-learning "
+                "qiskit-algorithms\n\n"
+                f"Original error: {exc}"
+            ) from exc
+
+    # --------------------------------------------------------
+    # Feature map
+    # --------------------------------------------------------
+
+    feature_map = build_feature_map(
+        n_qubits=n_qubits,
+        reps=feature_map_reps,
+    )
+
+    # --------------------------------------------------------
+    # Quantum kernel
+    # --------------------------------------------------------
+
+    kernel = FidelityQuantumKernel(
+        feature_map=feature_map
+    )
+
+    # --------------------------------------------------------
+    # QSVC
+    # --------------------------------------------------------
+
+    qsvc = QiskitQSVC(
+        quantum_kernel=kernel
+    )
+
+    print()
+    print("=" * 60)
+    print("QSVC CONFIGURATION")
+    print("=" * 60)
+
+    print(
+        f"Qubits           : {n_qubits}"
+    )
+
+    print(
+        f"Feature map reps : {feature_map_reps}"
+    )
+
+    print(
+        f"Kernel           : FidelityQuantumKernel"
+    )
+
+    print(
+        f"Shots            : {QSVC_SHOTS}"
+    )
+
+    print(
+        f"Random state     : {RANDOM_STATE}"
+    )
+
+    print("=" * 60)
+
+    return qsvc
+
+
+# ============================================================
+# TRAIN QSVC
+# ============================================================
 
 def train_qsvc(
     X_train: np.ndarray,
     y_train: np.ndarray,
     n_qubits: int = N_QUBITS,
-) -> object:
+    feature_map_reps: int = FEATURE_MAP_REPS,
+) -> tuple:
     """
     Train the QSVC.
 
-    Parameters
-    ----------
-    X_train  : np.ndarray  shape (n_samples, n_qubits)
-    y_train  : np.ndarray  shape (n_samples,)
-    n_qubits : int
-
     Returns
     -------
-    Fitted QSVC
+    fitted_qsvc, training_time_seconds
     """
-    qsvc = build_qsvc(n_qubits=n_qubits)
-    print(f"[qsvc] Training QSVC on {len(X_train)} samples, "
-          f"{n_qubits} qubits (quantum kernel computation) …")
-    print(f"[qsvc] NOTE: Kernel matrix computation has O(n²) cost; "
-          f"may be slow for large datasets.")
 
-    qsvc.fit(X_train, y_train)
-    print("[qsvc] Training complete.")
-    return qsvc
+    X_train = np.asarray(
+        X_train
+    )
+
+    y_train = np.asarray(
+        y_train
+    ).reshape(-1)
+
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
+
+    _validate_data(
+        X_train,
+        y_train,
+        "QSVC training data",
+    )
+
+    _validate_qubits(
+        X_train,
+        n_qubits,
+    )
+
+    unique_classes = np.unique(
+        y_train
+    )
+
+    if len(unique_classes) < 2:
+        raise ValueError(
+            "QSVC requires at least two classes."
+        )
+
+    # --------------------------------------------------------
+    # Shuffle training data
+    # --------------------------------------------------------
+
+    rng = np.random.default_rng(
+        RANDOM_STATE
+    )
+
+    indices = np.arange(
+        len(X_train)
+    )
+
+    rng.shuffle(
+        indices
+    )
+
+    X_train = X_train[
+        indices
+    ]
+
+    y_train = y_train[
+        indices
+    ]
+
+    # --------------------------------------------------------
+    # Build model
+    # --------------------------------------------------------
+
+    qsvc = build_qsvc(
+        n_qubits=n_qubits,
+        feature_map_reps=feature_map_reps,
+    )
+
+    print()
+    print("=" * 60)
+    print("QSVC TRAINING")
+    print("=" * 60)
+
+    print(
+        f"Training samples : {len(X_train)}"
+    )
+
+    print(
+        f"Features         : {X_train.shape[1]}"
+    )
+
+    print(
+        f"Classes          : {len(unique_classes)}"
+    )
+
+    print(
+        f"Class labels     : {unique_classes}"
+    )
+
+    print()
+    print(
+        "[qsvc] Computing quantum kernel..."
+    )
+
+    print(
+        "[qsvc] Kernel computation has "
+        "approximately O(n²) pairwise cost."
+    )
+
+    print(
+        "[qsvc] Training may take several minutes."
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Train
+    # --------------------------------------------------------
+
+    start_time = time.time()
+
+    qsvc.fit(
+        X_train,
+        y_train,
+    )
+
+    training_time = (
+        time.time()
+        - start_time
+    )
+
+    print()
+    print(
+        "[qsvc] Training complete."
+    )
+
+    print(
+        f"[qsvc] Training time: "
+        f"{training_time:.2f} seconds"
+    )
+
+    print(
+        f"[qsvc] Training time: "
+        f"{training_time / 60:.2f} minutes"
+    )
+
+    return (
+        qsvc,
+        training_time,
+    )
 
 
-# ---------------------------------------------------------------------------
-# Evaluation
-# ---------------------------------------------------------------------------
+# ============================================================
+# EVALUATE QSVC
+# ============================================================
 
 def evaluate_qsvc(
     qsvc,
-    X_test:  np.ndarray,
-    y_test:  np.ndarray,
-    classes: list | None = None,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
+    training_time: float = 0.0,
+    n_qubits: int = N_QUBITS,
+    feature_map_reps: int = FEATURE_MAP_REPS,
     save: bool = True,
 ) -> dict:
     """
-    Evaluate the trained QSVC and save results.
-
-    Parameters
-    ----------
-    qsvc    : fitted QSVC
-    X_test  : np.ndarray
-    y_test  : np.ndarray
-    classes : optional list of class names
-    save    : bool — persist outputs
-
-    Returns
-    -------
-    dict of metrics
+    Evaluate QSVC on the complete supplied test set.
     """
-    print(f"[qsvc] Evaluating on {len(X_test)} test samples …")
-    y_pred = qsvc.predict(X_test)
 
-    if classes is None:
-        classes = sorted(set(y_test))
+    X_test = np.asarray(
+        X_test
+    )
 
-    acc         = accuracy_score(y_test, y_pred)
-    macro_f1    = f1_score(y_test, y_pred, average="macro",    zero_division=0)
-    weighted_f1 = f1_score(y_test, y_pred, average="weighted", zero_division=0)
-    macro_pre   = precision_score(y_test, y_pred, average="macro",    zero_division=0)
-    macro_rec   = recall_score(   y_test, y_pred, average="macro",    zero_division=0)
-    report      = classification_report(y_test, y_pred, zero_division=0)
-    cm          = confusion_matrix(y_test, y_pred, labels=sorted(set(y_test)))
+    y_test = np.asarray(
+        y_test
+    ).reshape(-1)
+
+    # --------------------------------------------------------
+    # Validation
+    # --------------------------------------------------------
+
+    _validate_data(
+        X_test,
+        y_test,
+        "QSVC test data",
+    )
+
+    _validate_qubits(
+        X_test,
+        n_qubits,
+    )
+
+    print()
+    print("=" * 60)
+    print("QSVC EVALUATION")
+    print("=" * 60)
+
+    print(
+        f"Test samples : {len(X_test)}"
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Prediction
+    # --------------------------------------------------------
+
+    prediction_start = time.time()
+
+    y_pred = qsvc.predict(
+        X_test
+    )
+
+    prediction_time = (
+        time.time()
+        - prediction_start
+    )
+
+    y_pred = np.asarray(
+        y_pred
+    ).reshape(-1)
+
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
+    accuracy = accuracy_score(
+        y_test,
+        y_pred,
+    )
+
+    macro_f1 = f1_score(
+        y_test,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    weighted_f1 = f1_score(
+        y_test,
+        y_pred,
+        average="weighted",
+        zero_division=0,
+    )
+
+    macro_precision = precision_score(
+        y_test,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    macro_recall = recall_score(
+        y_test,
+        y_pred,
+        average="macro",
+        zero_division=0,
+    )
+
+    # --------------------------------------------------------
+    # Classification report
+    # --------------------------------------------------------
+
+    report_dict = classification_report(
+        y_test,
+        y_pred,
+        output_dict=True,
+        zero_division=0,
+    )
+
+    report_text = classification_report(
+        y_test,
+        y_pred,
+        zero_division=0,
+    )
+
+    # --------------------------------------------------------
+    # Classes
+    # --------------------------------------------------------
+
+    classes = sorted(
+        set(
+            np.concatenate(
+                [
+                    y_test,
+                    y_pred,
+                ]
+            )
+        )
+    )
+
+    # --------------------------------------------------------
+    # Confusion matrix
+    # --------------------------------------------------------
+
+    cm = confusion_matrix(
+        y_test,
+        y_pred,
+        labels=classes,
+    )
+
+    # --------------------------------------------------------
+    # Metrics dictionary
+    # --------------------------------------------------------
 
     metrics = {
-        "model"          : "QSVC",
-        "accuracy"       : float(acc),
-        "macro_f1"       : float(macro_f1),
-        "weighted_f1"    : float(weighted_f1),
-        "macro_precision": float(macro_pre),
-        "macro_recall"   : float(macro_rec),
-        "n_test"         : int(len(y_test)),
-        "n_qubits"       : N_QUBITS,
-        "feature_map_reps": int(2),
-        "random_state"   : RANDOM_STATE,
+        "model": "QSVC",
+
+        "accuracy": float(
+            accuracy
+        ),
+
+        "macro_f1": float(
+            macro_f1
+        ),
+
+        "weighted_f1": float(
+            weighted_f1
+        ),
+
+        "macro_precision": float(
+            macro_precision
+        ),
+
+        "macro_recall": float(
+            macro_recall
+        ),
+
+        "n_train": None,
+
+        "n_test": int(
+            len(y_test)
+        ),
+
+        "n_qubits": int(
+            n_qubits
+        ),
+
+        "feature_map_reps": int(
+            feature_map_reps
+        ),
+
+        "shots": QSVC_SHOTS,
+
+        "training_time_s": float(
+            training_time
+        ),
+
+        "prediction_time_s": float(
+            prediction_time
+        ),
+
+        "random_state": int(
+            RANDOM_STATE
+        ),
+
+        "classification_report":
+            report_dict,
     }
 
-    print("\n" + "=" * 60)
-    print("  QSVC RESULTS")
-    print("=" * 60)
-    print(f"  Accuracy     : {acc:.4f}")
-    print(f"  Macro F1     : {macro_f1:.4f}")
-    print(f"  Weighted F1  : {weighted_f1:.4f}")
-    print(f"  Macro Prec   : {macro_pre:.4f}")
-    print(f"  Macro Recall : {macro_rec:.4f}")
+    # --------------------------------------------------------
+    # Print results
+    # --------------------------------------------------------
+
     print()
-    print("  Classification Report:")
-    print(report)
+    print("=" * 60)
+    print("QSVC RESULTS")
     print("=" * 60)
 
+    print(
+        f"Accuracy     : {accuracy:.4f}"
+    )
+
+    print(
+        f"Macro F1     : {macro_f1:.4f}"
+    )
+
+    print(
+        f"Weighted F1  : {weighted_f1:.4f}"
+    )
+
+    print(
+        f"Macro Prec   : {macro_precision:.4f}"
+    )
+
+    print(
+        f"Macro Recall : {macro_recall:.4f}"
+    )
+
+    print(
+        f"Train time   : "
+        f"{training_time:.2f}s"
+    )
+
+    print(
+        f"Predict time : "
+        f"{prediction_time:.2f}s"
+    )
+
+    print()
+    print(
+        "Classification Report:"
+    )
+
+    print(
+        report_text
+    )
+
+    print("=" * 60)
+
+    # --------------------------------------------------------
+    # Save
+    # --------------------------------------------------------
+
     if save:
-        _save_qsvc_results(metrics, y_test, y_pred, list(classes), cm)
+
+        _save_qsvc_results(
+            metrics=metrics,
+            y_test=y_test,
+            y_pred=y_pred,
+            classes=classes,
+            cm=cm,
+        )
 
     return metrics
 
 
+# ============================================================
+# SAVE RESULTS
+# ============================================================
+
 def _save_qsvc_results(
     metrics: dict,
-    y_test:  np.ndarray,
-    y_pred:  np.ndarray,
+    y_test: np.ndarray,
+    y_pred: np.ndarray,
     classes: list,
-    cm:      np.ndarray,
+    cm: np.ndarray,
 ) -> None:
-    METRICS_DIR.mkdir(parents=True, exist_ok=True)
-    PREDICTIONS_DIR.mkdir(parents=True, exist_ok=True)
-    FIGURES_DIR.mkdir(parents=True, exist_ok=True)
+    """
+    Save metrics, predictions and confusion matrix.
+    """
 
-    metrics_path = METRICS_DIR / "qsvc_results.json"
-    with open(metrics_path, "w") as f:
-        json.dump(metrics, f, indent=2)
-    print(f"[qsvc] Metrics → {metrics_path}")
+    METRICS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    pred_df = pd.DataFrame({"true_label": y_test, "predicted": y_pred,
-                             "correct": y_test == y_pred})
-    pred_path = PREDICTIONS_DIR / "qsvc_predictions.csv"
-    pred_df.to_csv(pred_path, index=False)
-    print(f"[qsvc] Predictions → {pred_path}")
+    PREDICTIONS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
-    _plot_confusion_matrix(cm, classes,
-                           title="QSVC — Confusion Matrix",
-                           save_path=FIGURES_DIR / "qsvc_confusion_matrix.png")
+    FIGURES_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
 
+    # --------------------------------------------------------
+    # Metrics
+    # --------------------------------------------------------
+
+    metrics_path = (
+        METRICS_DIR /
+        "qsvc_results.json"
+    )
+
+    with open(
+        metrics_path,
+        "w",
+    ) as file:
+
+        json.dump(
+            metrics,
+            file,
+            indent=2,
+        )
+
+    print(
+        f"[qsvc] Metrics → "
+        f"{metrics_path}"
+    )
+
+    # --------------------------------------------------------
+    # Predictions
+    # --------------------------------------------------------
+
+    prediction_df = pd.DataFrame(
+        {
+            "true_label": y_test,
+            "predicted": y_pred,
+            "correct": (
+                y_test == y_pred
+            ),
+        }
+    )
+
+    prediction_path = (
+        PREDICTIONS_DIR /
+        "qsvc_predictions.csv"
+    )
+
+    prediction_df.to_csv(
+        prediction_path,
+        index=False,
+    )
+
+    print(
+        f"[qsvc] Predictions → "
+        f"{prediction_path}"
+    )
+
+    # --------------------------------------------------------
+    # Confusion matrix
+    # --------------------------------------------------------
+
+    confusion_path = (
+        FIGURES_DIR /
+        "qsvc_confusion_matrix.png"
+    )
+
+    _plot_confusion_matrix(
+        cm=cm,
+        labels=classes,
+        title="QSVC - Confusion Matrix",
+        save_path=confusion_path,
+    )
+
+
+# ============================================================
+# CONFUSION MATRIX
+# ============================================================
 
 def _plot_confusion_matrix(
     cm: np.ndarray,
     labels: list,
-    title: str = "Confusion Matrix",
+    title: str = "QSVC - Confusion Matrix",
     save_path: Path | None = None,
 ) -> None:
-    fig, ax = plt.subplots(figsize=(10, 8))
-    im = ax.imshow(cm, interpolation="nearest", cmap=plt.cm.Blues)
-    plt.colorbar(im, ax=ax)
-    ax.set(xticks=np.arange(len(labels)), yticks=np.arange(len(labels)),
-           xticklabels=labels, yticklabels=labels,
-           title=title, ylabel="True label", xlabel="Predicted label")
-    plt.setp(ax.get_xticklabels(), rotation=45, ha="right", rotation_mode="anchor")
-    thresh = cm.max() / 2.0
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            ax.text(j, i, str(cm[i, j]),
-                    ha="center", va="center",
-                    color="white" if cm[i, j] > thresh else "black", fontsize=9)
+    """
+    Plot confusion matrix.
+    """
+
+    fig, ax = plt.subplots(
+        figsize=(10, 8)
+    )
+
+    image = ax.imshow(
+        cm,
+        interpolation="nearest",
+        cmap=plt.cm.Blues,
+    )
+
+    plt.colorbar(
+        image,
+        ax=ax,
+    )
+
+    ax.set(
+        xticks=np.arange(
+            len(labels)
+        ),
+        yticks=np.arange(
+            len(labels)
+        ),
+        xticklabels=labels,
+        yticklabels=labels,
+        title=title,
+        ylabel="True label",
+        xlabel="Predicted label",
+    )
+
+    plt.setp(
+        ax.get_xticklabels(),
+        rotation=45,
+        ha="right",
+        rotation_mode="anchor",
+    )
+
+    threshold = (
+        cm.max() / 2.0
+        if cm.size > 0
+        else 0
+    )
+
+    for i in range(
+        cm.shape[0]
+    ):
+
+        for j in range(
+            cm.shape[1]
+        ):
+
+            ax.text(
+                j,
+                i,
+                str(cm[i, j]),
+                ha="center",
+                va="center",
+                color=(
+                    "white"
+                    if cm[i, j] > threshold
+                    else "black"
+                ),
+                fontsize=9,
+            )
+
     fig.tight_layout()
-    if save_path:
-        plt.savefig(save_path, dpi=150, bbox_inches="tight")
-        print(f"[plot] Confusion matrix saved → {save_path}")
-    plt.close()
+
+    if save_path is not None:
+
+        plt.savefig(
+            save_path,
+            dpi=150,
+            bbox_inches="tight",
+        )
+
+        print(
+            f"[plot] QSVC confusion matrix → "
+            f"{save_path}"
+        )
+
+    plt.close(fig)
 
 
-# ---------------------------------------------------------------------------
-# Save / load
-# ---------------------------------------------------------------------------
+# ============================================================
+# SAVE QSVC
+# ============================================================
 
-def save_qsvc(qsvc) -> None:
-    MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    with open(_QSVC_PATH, "wb") as f:
-        pickle.dump(qsvc, f)
-    print(f"[qsvc] Model saved → {_QSVC_PATH}")
+def save_qsvc(
+    qsvc,
+    n_qubits: int = N_QUBITS,
+    feature_map_reps: int = FEATURE_MAP_REPS,
+) -> None:
+    """
+    Save fitted QSVC and its configuration.
+    """
 
+    MODELS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    # --------------------------------------------------------
+    # Configuration
+    # --------------------------------------------------------
+
+    config = {
+        "model": "QSVC",
+
+        "n_qubits": int(
+            n_qubits
+        ),
+
+        "feature_map_reps": int(
+            feature_map_reps
+        ),
+
+        "shots": QSVC_SHOTS,
+
+        "random_state": int(
+            RANDOM_STATE
+        ),
+    }
+
+    config_path = (
+        MODELS_DIR /
+        "qsvc_config.json"
+    )
+
+    with open(
+        config_path,
+        "w",
+    ) as file:
+
+        json.dump(
+            config,
+            file,
+            indent=2,
+        )
+
+    print(
+        f"[qsvc] Config → "
+        f"{config_path}"
+    )
+
+    # --------------------------------------------------------
+    # Model
+    # --------------------------------------------------------
+
+    try:
+
+        with open(
+            _QSVC_PATH,
+            "wb",
+        ) as file:
+
+            pickle.dump(
+                qsvc,
+                file,
+            )
+
+        print(
+            f"[qsvc] Model → "
+            f"{_QSVC_PATH}"
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not save QSVC model."
+        )
+
+        raise RuntimeError(
+            f"Failed to save QSVC model: {exc}"
+        ) from exc
+
+
+# ============================================================
+# LOAD QSVC
+# ============================================================
 
 def load_qsvc():
+    """
+    Load saved QSVC model.
+    """
+
     if not _QSVC_PATH.exists():
+
         raise FileNotFoundError(
-            f"QSVC model not found at {_QSVC_PATH}\n"
-            f"Run:  python main.py --stage qsvc"
+            f"\nQSVC model not found at:\n"
+            f"{_QSVC_PATH}\n\n"
+            "Train it first using:\n"
+            "python main.py --stage qsvc"
         )
-    with open(_QSVC_PATH, "rb") as f:
-        return pickle.load(f)
+
+    with open(
+        _QSVC_PATH,
+        "rb",
+    ) as file:
+
+        qsvc = pickle.load(
+            file
+        )
+
+    print(
+        f"[qsvc] Loaded model → "
+        f"{_QSVC_PATH}"
+    )
+
+    return qsvc
 
 
-# ---------------------------------------------------------------------------
-# Stage runner
-# ---------------------------------------------------------------------------
+# ============================================================
+# COMPLETE QSVC STAGE
+# ============================================================
 
 def run_qsvc_stage(
     X_train: np.ndarray,
     y_train: np.ndarray,
-    X_test:  np.ndarray,
-    y_test:  np.ndarray,
+    X_test: np.ndarray,
+    y_test: np.ndarray,
     n_qubits: int = N_QUBITS,
+    feature_map_reps: int = FEATURE_MAP_REPS,
 ) -> dict:
-    """Train, evaluate, and save QSVC.  Returns metrics dict."""
-    qsvc    = train_qsvc(X_train, y_train, n_qubits=n_qubits)
-    save_qsvc(qsvc)
-    metrics = evaluate_qsvc(qsvc, X_test, y_test, save=True)
-    metrics["n_train"] = len(X_train)
+    """
+    Complete QSVC pipeline:
+
+        Validate
+            ↓
+        Train
+            ↓
+        Save
+            ↓
+        Evaluate
+            ↓
+        Save metrics
+    """
+
+    # --------------------------------------------------------
+    # Convert input
+    # --------------------------------------------------------
+
+    X_train = np.asarray(
+        X_train
+    )
+
+    y_train = np.asarray(
+        y_train
+    ).reshape(-1)
+
+    X_test = np.asarray(
+        X_test
+    )
+
+    y_test = np.asarray(
+        y_test
+    ).reshape(-1)
+
+    # --------------------------------------------------------
+    # Validate
+    # --------------------------------------------------------
+
+    _validate_data(
+        X_train,
+        y_train,
+        "QSVC training data",
+    )
+
+    _validate_data(
+        X_test,
+        y_test,
+        "QSVC test data",
+    )
+
+    _validate_qubits(
+        X_train,
+        n_qubits,
+    )
+
+    _validate_qubits(
+        X_test,
+        n_qubits,
+    )
+
+    # --------------------------------------------------------
+    # Train
+    # --------------------------------------------------------
+
+    qsvc, training_time = train_qsvc(
+        X_train=X_train,
+        y_train=y_train,
+        n_qubits=n_qubits,
+        feature_map_reps=feature_map_reps,
+    )
+
+    # --------------------------------------------------------
+    # Save model
+    # --------------------------------------------------------
+
+    save_qsvc(
+        qsvc=qsvc,
+        n_qubits=n_qubits,
+        feature_map_reps=feature_map_reps,
+    )
+
+    # --------------------------------------------------------
+    # Evaluate
+    # --------------------------------------------------------
+
+    metrics = evaluate_qsvc(
+        qsvc=qsvc,
+        X_test=X_test,
+        y_test=y_test,
+        training_time=training_time,
+        n_qubits=n_qubits,
+        feature_map_reps=feature_map_reps,
+        save=True,
+    )
+
+    # --------------------------------------------------------
+    # Add actual training size
+    # --------------------------------------------------------
+
+    metrics["n_train"] = int(
+        len(X_train)
+    )
+
+    # --------------------------------------------------------
+    # Re-save final metrics
+    # --------------------------------------------------------
+
+    METRICS_DIR.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    metrics_path = (
+        METRICS_DIR /
+        "qsvc_results.json"
+    )
+
+    with open(
+        metrics_path,
+        "w",
+    ) as file:
+
+        json.dump(
+            metrics,
+            file,
+            indent=2,
+        )
+
+    print(
+        f"[qsvc] Final metrics → "
+        f"{metrics_path}"
+    )
+
     return metrics
